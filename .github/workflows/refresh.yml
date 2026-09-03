@@ -1,0 +1,62 @@
+name: Refresh market data
+
+# Daily, plus a manual trigger. The time is arbitrary but deliberately not on
+# the hour: GitHub's scheduler queues heavily at :00 and can delay a run by
+# tens of minutes.
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+
+# The job commits market.json back to this branch, which is all it may do.
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-market-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The generator is stdlib-only by design — nothing to install, and no
+      # dependency that can break this feed months from now.
+      - name: Build market.json
+        run: python3 build_market_data.py --out market.json
+
+      - name: Verify the output before publishing it
+        run: |
+          python3 - <<'PY'
+          import json, sys, datetime
+          feed = json.load(open("market.json"))
+          assert feed["schema"] == 1, "schema drifted; the app would refuse this"
+          for key in ("gold_usd_per_troy_oz", "us_equity_market_value_usd",
+                      "all_gold_ever_mined_troy_oz"):
+              assert feed[key] > 0, f"{key} is not positive"
+          # The app refuses a feed older than 21 days. Catch a stuck clock here
+          # rather than publishing something every install will silently ignore.
+          age = datetime.datetime.now(datetime.timezone.utc) - \
+                datetime.datetime.fromisoformat(feed["generated_at"].replace("Z", "+00:00"))
+          assert age.days < 1, f"generated_at is {age.days} days old"
+          print(f"ok: ${feed['gold_usd_per_troy_oz']:,.2f}/oz, "
+                f"${feed['us_equity_market_value_usd'] / 1e12:,.2f}T equities")
+          PY
+
+      - name: Commit if the numbers changed
+        run: |
+          if git diff --quiet -- market.json; then
+            echo "No change; nothing to publish."
+            exit 0
+          fi
+          git config user.name "borrowedtime-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add market.json
+          git commit -m "Refresh market data"
+          git push

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-03T12:30:35Z",
+  "gold_usd_per_troy_oz": 4447.6,
+  "gold_as_of": "2026-09-03",
+  "gold_source": "Spot gold, USD per fine troy ounce",
+  "us_equity_market_value_usd": 91857203000000.0,
+  "equity_as_of": "2026-03-31",
+  "equity_source": "Federal Reserve Z.1 Financial Accounts, corporate equities at market value",
+  "all_gold_ever_mined_troy_oz": 6953081213.45,
+  "all_gold_as_of": "2024-12-31",
+  "all_gold_source": "World Gold Council, above-ground stocks"
+}
