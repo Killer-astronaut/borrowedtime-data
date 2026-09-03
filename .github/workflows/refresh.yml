@@ -60,3 +60,51 @@ jobs:
           git add market.json
           git commit -m "Refresh market data"
           git push
+
+      # A recovered feed shouldn't leave a stale alarm open.
+      - name: Close any open failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label feed-failure --state open --json number --jq '.[].number'); do
+            gh issue comment "$n" --body "Recovered: [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) published successfully."
+            gh issue close "$n"
+          done
+
+  # Failure here is silent by nature — a scheduled job that stops running
+  # produces no error anyone sees. The app degrades quietly too: it serves the
+  # last good file, then ignores the feed once it is 21 days old. So the
+  # failure has to come and find you.
+  notify:
+    needs: refresh
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body=$(cat <<EOF
+          The daily market-data job failed.
+
+          **Run:** $RUN_URL
+
+          The published \`market.json\` is untouched, so the app keeps serving the
+          last good figures. It stops showing the Gold Standard card's market rows
+          once the feed is **21 days old**, so this wants a look before then.
+
+          Common causes: the gold price source moved or went away, or the Z.1 CSV
+          layout changed. Both are fixed by editing \`build_market_data.py\` — no
+          app release needed.
+          EOF
+          )
+          # One thread rather than one issue per day.
+          existing=$(gh issue list --label feed-failure --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Market data feed is failing" --label feed-failure --body "$body"
+          fi
