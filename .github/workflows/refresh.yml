@@ -8,9 +8,8 @@ on:
     - cron: "17 11 * * *"
   workflow_dispatch:
 
-# The job commits market.json back to this branch, which is all it may do.
-permissions:
-  contents: write
+# Declared per job rather than workflow-wide: the refresh job commits and also
+# closes a recovered alarm, so it needs both scopes; notify only needs issues.
 
 concurrency:
   group: refresh-market-data
@@ -19,6 +18,9 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # commit the refreshed market.json
+      issues: write     # close the failure issue once the feed recovers
     steps:
       - uses: actions/checkout@v4
 
