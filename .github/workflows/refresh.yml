@@ -65,6 +65,7 @@ jobs:
       - name: Close any open failure issue
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           for n in $(gh issue list --label feed-failure --state open --json number --jq '.[].number'); do
             gh issue comment "$n" --body "Recovered: [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) published successfully."
@@ -85,6 +86,9 @@ jobs:
       - name: Open or update the failure issue
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job has no checkout, so gh cannot infer the repo from a git
+          # remote — without this it exits 1 and the alarm never fires.
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           body=$(cat <<EOF
