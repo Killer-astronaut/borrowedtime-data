@@ -28,6 +28,11 @@ The generator is stdlib-only — no dependencies to rot.
 
 **Failure behaviour is deliberate:**
 
+- Every fetch is retried twice (after 2s, then 8s) before the run gives up. A
+  runner's DNS resolver failing for half a second shouldn't cost a day's price.
+  A status that means the source itself changed — 404 from one that moved, 401
+  from one that started demanding a key — fails on the first attempt instead,
+  so the alarm arrives promptly.
 - Gold price unavailable → the run fails and publishes nothing. The previous `market.json` stays up.
 - Z.1 unavailable → the previous quarterly equity figures are carried forward, and the fresh gold price is still published. A source that changes four times a year shouldn't block the one that changes daily.
 - Feed older than 21 days → **the app ignores it** and shows Treasury figures only. A dead job surfaces as missing rows, never as a stale number presented as current.

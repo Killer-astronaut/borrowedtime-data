@@ -40,9 +40,11 @@ Stdlib only. Usage:  python3 tools/build_market_data.py [--out market.json]
 
 import argparse
 import csv
+import http.client
 import io
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -89,19 +91,67 @@ Z1_TABLE = "csv/F51_1_s.csv"
 Z1_EQUITY_SERIES = ("LM103164105.Q", "LM793164105.Q")
 Z1_SOURCE = "Federal Reserve Z.1 Financial Accounts, corporate equities at market value"
 
+# A scheduled run gets one shot a day, and the runner's DNS resolver failing
+# for half a second is enough to lose it — that is what took the feed down on
+# 2026-09-13, with the source itself perfectly healthy a moment later. So every
+# fetch gets a few attempts before the day is written off. The delays are short
+# on purpose: a source that is genuinely gone should still fail the run inside a
+# minute and raise the alarm, not hold a job open waiting for it to come back.
+FETCH_BACKOFF_SECONDS = (2.0, 8.0)
+FETCH_ATTEMPTS = len(FETCH_BACKOFF_SECONDS) + 1  # one try, then one per delay
+
+# Worth another attempt: the server is overloaded, rate-limiting, or behind a
+# proxy having a bad moment. Anything else (a 404 from a source that moved, a
+# 401 from one that started demanding a key) is a real change that wants a
+# human, so it fails immediately rather than three times slowly.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
 # Refuse a price outside this band. A feed that starts returning 0, or a
 # per-gram price mislabelled as per-ounce, would otherwise sail through and
 # put an absurd headline in front of users.
 GOLD_SANE_RANGE = (200.0, 100000.0)
 
 
+def fetch(url, timeout, what):
+    """GET url and return the body, retrying the failures worth retrying.
+
+    `what` names the source in the error the alarm ends up quoting: "gold
+    source unreachable" is a starting point, "<urlopen error ...>" on its own
+    is not.
+    """
+    last_error = None
+
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"{what} returned HTTP {response.status}")
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if error.code not in RETRYABLE_STATUS:
+                raise RuntimeError(f"{what} returned HTTP {error.code}") from error
+            last_error = error
+        # URLError (DNS, refused connection, TLS), a read that timed out, and a
+        # connection reset mid-transfer are all OSError; a truncated response is
+        # not, hence the second class.
+        except (OSError, http.client.HTTPException) as error:
+            last_error = error
+
+        if attempt < FETCH_ATTEMPTS:
+            delay = FETCH_BACKOFF_SECONDS[attempt - 1]
+            print(f"  {what}: {last_error}; retrying in {delay:.0f}s "
+                  f"({attempt}/{FETCH_ATTEMPTS - 1})", file=sys.stderr)
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"{what} unreachable after {FETCH_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
+
+
 def fetch_gold_price():
     """USD per fine troy ounce, with the source's own timestamp."""
-    request = urllib.request.Request(GOLD_URL, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        if response.status != 200:
-            raise RuntimeError(f"gold source returned HTTP {response.status}")
-        payload = json.load(response)
+    payload = json.loads(fetch(GOLD_URL, timeout=30, what="gold source"))
 
     price = float(payload["price"])
     low, high = GOLD_SANE_RANGE
@@ -118,12 +168,9 @@ def fetch_us_equity_market_value():
     Returns (value, period) where period is the Z.1 quarter label, e.g.
     "2026:Q1", normalised to the quarter-end date the app displays.
     """
-    # federalreserve.gov rejects urllib's default User-Agent with a 403.
-    request = urllib.request.Request(Z1_CSV_ZIP, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=180) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Z.1 returned HTTP {response.status}")
-        payload = response.read()
+    # federalreserve.gov rejects urllib's default User-Agent with a 403, which
+    # fetch() sends straight to the caller rather than retrying.
+    payload = fetch(Z1_CSV_ZIP, timeout=180, what="Z.1")
 
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         with archive.open(Z1_TABLE) as handle:
