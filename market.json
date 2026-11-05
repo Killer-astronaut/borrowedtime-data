@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "generated_at": "2026-11-04T18:38:34Z",
-  "gold_usd_per_troy_oz": 4063.8,
-  "gold_as_of": "2026-11-04",
+  "generated_at": "2026-11-05T18:44:58Z",
+  "gold_usd_per_troy_oz": 4103.6,
+  "gold_as_of": "2026-11-05",
   "gold_source": "Spot gold, USD per fine troy ounce",
   "us_equity_market_value_usd": 109244695000000.0,
   "equity_as_of": "2026-06-30",
