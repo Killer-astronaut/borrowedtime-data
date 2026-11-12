@@ -8,7 +8,7 @@ The daily data feed behind the **Gold Standard** card in [Borrowed Time](https:/
 
 | Field | Source | Cadence |
 |---|---|---|
-| `gold_usd_per_troy_oz` | Spot gold | Daily |
+| `gold_usd_per_troy_oz` | Spot gold (gold-api.com, falling back to Swissquote's public quotes) | Daily |
 | `us_equity_market_value_usd` | Federal Reserve Z.1, corporate equities at market value (issuer side, series `LM103164105` + `LM793164105`) | Quarterly, ~75-day lag |
 | `all_gold_ever_mined_troy_oz` | World Gold Council above-ground stocks | Reviewed annually |
 
@@ -28,17 +28,30 @@ The generator is stdlib-only — no dependencies to rot.
 
 **Failure behaviour is deliberate:**
 
-- Every fetch is retried twice (after 2s, then 8s) before the run gives up. A
-  runner's DNS resolver failing for half a second shouldn't cost a day's price.
-  A status that means the source itself changed — 404 from one that moved, 401
-  from one that started demanding a key — fails on the first attempt instead,
-  so the alarm arrives promptly.
-- Gold price unavailable → the run fails and publishes nothing. The previous `market.json` stays up.
-- Z.1 unavailable → the previous quarterly equity figures are carried forward, and the fresh gold price is still published. A source that changes four times a year shouldn't block the one that changes daily.
+- Each source fails on its own. Whatever was fetched is published; whatever was not keeps its previous value *and its previous "as of" date*.
+- Gold has two unrelated keyless sources, tried in order (`GOLD_SOURCES` in the script). A price that has moved more than 20% from the last published one is only believed if both agree.
+- `generated_at` advances only when the gold price is fresh. It is the one field the app's staleness check reads, so a run that could not get gold can publish a new quarter's equities but cannot make an old price look new.
+- Any failed source fails the run — after a second attempt five minutes later — and opens (or comments on) a `feed-failure` issue that quotes which source and which field. The next clean run closes it.
 - Feed older than 21 days → **the app ignores it** and shows Treasury figures only. A dead job surfaces as missing rows, never as a stale number presented as current.
+
+## When a source changes
+
+The issue names the source and the field. Then:
+
+1. Save the source's new response over its sample in `tests/samples/`.
+2. `python3 -m unittest discover -s tests` — the failing test shows what the parser no longer finds.
+3. Fix the parser in `build_market_data.py` (or add a replacement source to `GOLD_SOURCES`) until the tests pass.
+
+The app decodes exactly the eleven fields in `market.json` and refuses any `schema` other than 1, so the file's shape is not something to change here; there is a test holding it still.
 
 ## Running it by hand
 
 ```
 python3 build_market_data.py --out market.json
+```
+
+Tests (stdlib only, no network):
+
+```
+python3 -m unittest discover -s tests
 ```

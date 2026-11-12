@@ -21,6 +21,8 @@ jobs:
     permissions:
       contents: write   # commit the refreshed market.json
       issues: write     # close the failure issue once the feed recovers
+    outputs:
+      problems: ${{ steps.build.outputs.problems }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,25 +32,64 @@ jobs:
 
       # The generator is stdlib-only by design — nothing to install, and no
       # dependency that can break this feed months from now.
+      #
+      # It exits non-zero if any source failed, having still written whatever
+      # was fresh (see FAILURE BEHAVIOUR in the script). That status is held
+      # rather than failing the step, so a good gold price is still published
+      # on a day Z.1 is down; the last step fails the job and raises the alarm.
+      #
+      # One more attempt after five minutes: the scheduler gives this job one
+      # run a day, and the failures seen so far (2026-09-13, 2026-11-12) were
+      # the runner's own DNS, gone seconds later. The script's retries are
+      # deliberately too short to ride that out.
       - name: Build market.json
-        run: python3 build_market_data.py --out market.json
+        id: build
+        run: |
+          attempt() {
+            status=0
+            python3 build_market_data.py --out market.json 2> build-errors.txt || status=$?
+            cat build-errors.txt >&2
+          }
+          attempt
+          if [ "$status" -ne 0 ]; then
+            echo "A source failed; trying once more in 5 minutes." >&2
+            sleep 300
+            attempt
+          fi
+          {
+            echo "status=$status"
+            echo "problems<<END_OF_PROBLEMS_7c1f"
+            # The script's own one-line-per-source summary; failing that
+            # (it crashed), the end of whatever it did say.
+            { grep '^FAILED: ' build-errors.txt || tail -n 5 build-errors.txt; } | cut -c1-600 | head -n 10
+            echo "END_OF_PROBLEMS_7c1f"
+          } >> "$GITHUB_OUTPUT"
+          rm -f build-errors.txt
 
       - name: Verify the output before publishing it
+        env:
+          BUILD_STATUS: ${{ steps.build.outputs.status }}
         run: |
           python3 - <<'PY'
-          import json, sys, datetime
+          import json, os, datetime
           feed = json.load(open("market.json"))
           assert feed["schema"] == 1, "schema drifted; the app would refuse this"
           for key in ("gold_usd_per_troy_oz", "us_equity_market_value_usd",
                       "all_gold_ever_mined_troy_oz"):
               assert feed[key] > 0, f"{key} is not positive"
-          # The app refuses a feed older than 21 days. Catch a stuck clock here
-          # rather than publishing something every install will silently ignore.
           age = datetime.datetime.now(datetime.timezone.utc) - \
                 datetime.datetime.fromisoformat(feed["generated_at"].replace("Z", "+00:00"))
-          assert age.days < 1, f"generated_at is {age.days} days old"
+          assert age >= datetime.timedelta(minutes=-5), "generated_at is in the future"
+          # The app refuses a feed older than 21 days. After a clean build the
+          # clock must have moved; catch a stuck one here rather than publishing
+          # something every install will silently ignore. After a failed build
+          # it must NOT have been moved onto a stale gold price, which is the
+          # script's job — all that can be checked here is that it's plausible.
+          if os.environ["BUILD_STATUS"] == "0":
+              assert age.days < 1, f"generated_at is {age.days} days old"
           print(f"ok: ${feed['gold_usd_per_troy_oz']:,.2f}/oz, "
-                f"${feed['us_equity_market_value_usd'] / 1e12:,.2f}T equities")
+                f"${feed['us_equity_market_value_usd'] / 1e12:,.2f}T equities, "
+                f"generated {feed['generated_at']}")
           PY
 
       - name: Commit if the numbers changed
@@ -65,6 +106,7 @@ jobs:
 
       # A recovered feed shouldn't leave a stale alarm open.
       - name: Close any open failure issue
+        if: steps.build.outputs.status == '0'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -73,6 +115,12 @@ jobs:
             gh issue comment "$n" --body "Recovered: [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) published successfully."
             gh issue close "$n"
           done
+
+      - name: Fail the run if any source failed
+        if: steps.build.outputs.status != '0'
+        run: |
+          echo "::error::A source failed. Whatever was fresh has been published; see the Build step."
+          exit 1
 
   # Failure here is silent by nature — a scheduled job that stops running
   # produces no error anyone sees. The app degrades quietly too: it serves the
@@ -92,25 +140,38 @@ jobs:
           # remote — without this it exits 1 and the alarm never fires.
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Passed through the environment, never interpolated into the script:
+          # this text quotes upstream error messages.
+          PROBLEMS: ${{ needs.refresh.outputs.problems }}
         run: |
-          body=$(cat <<EOF
-          The daily market-data job failed.
+          # Written to a file rather than captured in a variable: a heredoc inside
+          # a command substitution is parsed differently across bash versions
+          # once the text contains an apostrophe.
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          The daily market-data job failed. (Sources are tried twice, five minutes apart.)
 
           **Run:** $RUN_URL
 
-          The published \`market.json\` is untouched, so the app keeps serving the
-          last good figures. It stops showing the Gold Standard card's market rows
-          once the feed is **21 days old**, so this wants a look before then.
+          **What failed:**
+          \`\`\`
+          ${PROBLEMS:-No source reported an error, so a workflow step failed instead (checkout, verify, commit or push). See the run.}
+          \`\`\`
 
-          Common causes: the gold price source moved or went away, or the Z.1 CSV
-          layout changed. Both are fixed by editing \`build_market_data.py\` — no
-          app release needed.
+          Figures from any source that did answer were still published. The rest
+          keep their previous values and dates, so the app goes on serving the
+          last good figures. It stops showing the Gold Standard card's market
+          rows once the gold price is **21 days old**, so this wants a look
+          before then.
+
+          Each line above names the source and the field. A source that moved or
+          changed layout is fixed in \`build_market_data.py\` (save the new
+          response under \`tests/samples/\` first and let the tests show what
+          broke) — no app release needed.
           EOF
-          )
           # One thread rather than one issue per day.
           existing=$(gh issue list --label feed-failure --state open --limit 1 --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/body.md"
           else
-            gh issue create --title "Market data feed is failing" --label feed-failure --body "$body"
+            gh issue create --title "Market data feed is failing" --label feed-failure --body-file "$RUNNER_TEMP/body.md"
           fi
