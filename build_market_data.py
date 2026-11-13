@@ -22,12 +22,14 @@ WHY A FEED INSTEAD OF THE APP CALLING A PRICE API DIRECTLY
 
 SOURCES
 
-  Gold spot     Two keyless sources run by unrelated operators, tried in
-                order: api.gold-api.com, then Swissquote's public quote feed.
-                Both are unofficial and unsupported, which is tolerable here
-                precisely because only this script depends on them — and why
-                there are two. Swap either and bump nothing: the app never
-                sees the source. See GOLD_SOURCES.
+  Gold spot     Three keyless sources run by unrelated operators: Swissquote's
+                public quote feed, api.gold-api.com, and the open currency-api
+                dataset on jsDelivr. All are unofficial and unsupported, which
+                is tolerable here precisely because only this script depends on
+                them — and why there are three. Every one is asked on every
+                run, so a source that has quietly died is noticed while the
+                others still cover for it. Swap any and bump nothing: the app
+                never sees the source. See GOLD_SOURCES.
   US equities   Federal Reserve Z.1 (Financial Accounts) — corporate equities
                 at market value, issuer side, fetched and summed from the
                 published CSV bundle. Public domain, quarterly, roughly a
@@ -52,7 +54,14 @@ FAILURE BEHAVIOUR
   so the scheduled job can raise its alarm — including for a Z.1 failure,
   which used to be carried forward in silence indefinitely.
 
-Stdlib only. Usage:  python3 build_market_data.py [--out market.json]
+  A gold source failing while another still supplies the price is not a
+  failure: the run exits 0. But with --health FILE the script remembers, from
+  run to run, since when each gold source has been failing, and prints a
+  "WARNING:" line once one has failed for GOLD_WARN_AFTER_DAYS days running.
+  Redundancy that has silently worn down to one source is the 2026-11-12
+  outage waiting to happen again.
+
+Stdlib only. Usage:  python3 build_market_data.py [--out market.json] [--health source_health.json]
 Tests:               python3 -m unittest discover -s tests
 """
 
@@ -139,6 +148,16 @@ GOLD_SANE_RANGE = (200.0, 100000.0)
 GOLD_MAX_MOVE = 0.20
 GOLD_MOVE_WINDOW = timedelta(days=10)
 GOLD_AGREEMENT = 0.02
+
+# A source that publishes a daily snapshot rather than a live quote can stop
+# updating without ever returning an error. Older than this, it is not a price.
+GOLD_MAX_SNAPSHOT_AGE = timedelta(days=5)
+
+# A gold source that has failed on this many consecutive days is reported,
+# even though another source is still supplying the price. Long enough to
+# ignore a bad day or a weekend outage; short enough that the feed does not
+# run for weeks on its last working source without anyone knowing.
+GOLD_WARN_AFTER_DAYS = 3
 
 # Same idea for equities: U.S. corporate equity has been tens of trillions of
 # dollars for decades. A total outside this band means the units changed
@@ -287,6 +306,41 @@ def parse_swissquote(body, today):
     return statistics.median(mids), as_of
 
 
+def parse_currency_api(body, today):
+    """fawazahmed0/currency-api, xau.json -> (price, as_of).
+
+    {"date": "2026-11-13", "xau": {"usd": 3904.20944053, "eur": ..., ...}}
+
+    A daily snapshot of one troy ounce of gold in every currency, published as
+    an npm package and served by jsDelivr. Not a live quote, which is why it is
+    last in line and why its date is checked: a package that stops being
+    published would otherwise serve its final price forever.
+    """
+    what = "currency-api"
+    payload = _load_json(body, what)
+    if not isinstance(payload, dict):
+        raise SourceError(f"{what}: expected a JSON object, got {type(payload).__name__}")
+    rates = payload.get("xau")
+    if not isinstance(rates, dict):
+        raise SourceError(f"{what}: field 'xau' is missing or not an object (fields "
+                          f"present: {', '.join(sorted(payload)) or 'none'})")
+    if "usd" not in rates:
+        raise SourceError(f"{what}: field 'xau.usd' is missing")
+    price = _positive_number(rates["usd"], what, "xau.usd")
+
+    as_of = str(payload.get("date", ""))
+    try:
+        snapshot = datetime.strptime(as_of, "%Y-%m-%d")
+        age = datetime.strptime(today, "%Y-%m-%d") - snapshot
+    except ValueError as error:
+        raise SourceError(f"{what}: field 'date' is {payload.get('date')!r}, expected "
+                          f"YYYY-MM-DD") from error
+    if age > GOLD_MAX_SNAPSHOT_AGE:
+        raise SourceError(f"{what}: field 'date' is {as_of}, {age.days} days old; "
+                          f"the snapshot has stopped updating")
+    return price, as_of
+
+
 def _iso_date(value, fallback):
     """The leading YYYY-MM-DD of a timestamp, or `fallback` if it isn't one."""
     text = str(value or "")[:10]
@@ -297,17 +351,21 @@ def _iso_date(value, fallback):
     return text
 
 
-# Tried in order; the first believable price wins. They share nothing — not a
-# host, a DNS zone, or an operator — which is the point: the 2026-11-12 failure
-# was the runner being unable to resolve the one and only gold host for ten
-# seconds. To add or replace a source, write a parser that returns
+# Every source is asked on every run; the first believable price, in this
+# order, is the one published. They share nothing — not a host, a DNS zone, or
+# an operator — which is the point: the 2026-11-12 failure was the runner being
+# unable to resolve the one and only gold host. Live quotes come before the
+# daily snapshot. To add or replace a source, write a parser that returns
 # (price, as_of) or raises SourceError, save a real response under
 # tests/samples/, and add a line here.
 GOLD_SOURCES = (
-    ("gold-api.com", "https://api.gold-api.com/price/XAU", parse_gold_api),
     ("Swissquote",
      "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
      parse_swissquote),
+    ("gold-api.com", "https://api.gold-api.com/price/XAU", parse_gold_api),
+    ("currency-api",
+     "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/xau.json",
+     parse_currency_api),
 )
 
 
@@ -326,20 +384,21 @@ def recent_gold_price(previous, now):
     return None
 
 
-def fetch_gold_price(previous=None, now=None, fetcher=fetch):
-    """USD per fine troy ounce, with the source's own date.
+def survey_gold(previous=None, now=None, fetcher=fetch):
+    """Ask every gold source. Returns (quote, outcomes).
 
-    Raises SourceError listing what went wrong with every source if none of
-    them produced a believable price.
+    `quote` is (price, as_of) from the first source, in GOLD_SOURCES order,
+    whose price is believable — or None if no source produced one.
+    `outcomes` maps every source name to None if it answered with a usable
+    price, or to the reason it did not.
     """
     now = now or datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
     reference = recent_gold_price(previous, now)
     low, high = GOLD_SANE_RANGE
 
-    failures = []
-    unconfirmed = []  # prices that parsed but moved too far to trust alone
-
+    outcomes = {}
+    quotes = []  # (name, price, as_of), in order
     for name, url, parse in GOLD_SOURCES:
         try:
             price, as_of = parse(fetcher(url, timeout=30, what=name), today)
@@ -347,23 +406,77 @@ def fetch_gold_price(previous=None, now=None, fetcher=fetch):
                 raise SourceError(f"{name}: price {price} is outside the sane range "
                                   f"{low:,.0f}–{high:,.0f} USD/oz")
         except SourceError as error:
-            print(f"  gold: {error}", file=sys.stderr)
-            failures.append(str(error))
+            outcomes[name] = str(error)
+        # A source answering in a shape nobody anticipated is that source's
+        # failure, not a reason to lose the others.
+        except Exception as error:  # noqa: BLE001
+            outcomes[name] = f"{name}: unexpected {type(error).__name__}: {error}"
+        else:
+            outcomes[name] = None
+            quotes.append((name, price, as_of))
+        if outcomes[name]:
+            print(f"  gold: {outcomes[name]}", file=sys.stderr)
+
+    def confirmed(name, price):
+        return any(abs(price - other) <= GOLD_AGREEMENT * other
+                   for other_name, other, _ in quotes if other_name != name)
+
+    chosen = None
+    for name, price, as_of in quotes:
+        plausible = reference is None or abs(price - reference) <= GOLD_MAX_MOVE * reference
+        # A big move is believed only if a second source independently agrees.
+        if plausible or confirmed(name, price):
+            chosen = chosen or (price, as_of)
             continue
+        outcomes[name] = (
+            f"{name}: price {price:,.2f} is {abs(price - reference) / reference:.0%} "
+            f"away from the last published {reference:,.2f} and no other source "
+            f"confirms it")
+        print(f"  gold: {outcomes[name]}", file=sys.stderr)
 
-        if reference is None or abs(price - reference) <= GOLD_MAX_MOVE * reference:
-            return price, as_of
-        if any(abs(price - other) <= GOLD_AGREEMENT * other for other in unconfirmed):
-            return price, as_of  # a big move, but two sources agree on it
+    return chosen, outcomes
 
-        unconfirmed.append(price)
-        message = (f"{name}: price {price:,.2f} is {abs(price - reference) / reference:.0%} "
-                   f"away from the last published {reference:,.2f} and no other "
-                   f"source confirms it")
-        print(f"  gold: {message}", file=sys.stderr)
-        failures.append(message)
 
-    raise SourceError("gold price: " + "; ".join(failures))
+def fetch_gold_price(previous=None, now=None, fetcher=fetch):
+    """USD per fine troy ounce, with the source's own date.
+
+    Raises SourceError listing what went wrong with every source if none of
+    them produced a believable price.
+    """
+    quote, outcomes = survey_gold(previous, now, fetcher)
+    if quote is None:
+        raise SourceError("gold price: " + "; ".join(outcomes.values()))
+    return quote
+
+
+def update_health(health, outcomes, today):
+    """Returns (new health, warnings).
+
+    `health` is the previous run's record — {source: {"failing_since": date or
+    None, "last_error": text or None}} — or anything at all if the file was
+    missing or mangled. A source's clock starts on the first day it fails and
+    is cleared the moment it answers, so "failing since" means every run since.
+    """
+    health = health if isinstance(health, dict) else {}
+    updated, warnings = {}, []
+    for name, error in outcomes.items():
+        if error is None:
+            updated[name] = {"failing_since": None, "last_error": None}
+            continue
+        before = health.get(name)
+        since = before.get("failing_since") if isinstance(before, dict) else None
+        try:
+            days = (datetime.strptime(today, "%Y-%m-%d")
+                    - datetime.strptime(str(since), "%Y-%m-%d")).days
+        except ValueError:
+            since, days = today, 0
+        if days < 0:  # a clock went backwards somewhere; start again
+            since, days = today, 0
+        updated[name] = {"failing_since": since, "last_error": error}
+        if days + 1 >= GOLD_WARN_AFTER_DAYS:
+            warnings.append(f"gold source {name} has failed on every run since {since} "
+                            f"({days + 1} days). Latest error: {error}")
+    return updated, warnings
 
 
 # ── Equities ─────────────────────────────────────────────────────────────────
@@ -489,26 +602,24 @@ def usable_previous(previous):
 
 
 def build(previous=None, now=None, fetcher=fetch):
-    """Returns (feed, problems).
+    """Returns (feed, problems, gold_outcomes).
 
-    `problems` has one line per source that failed. `feed` is what should be
-    on disk afterwards: fresh figures where a source answered, the previous
-    file's figures (and dates) where it did not, or None if a source failed
-    and there is no previous file to fall back on.
+    `problems` has one line per figure that could not be refreshed. `feed` is
+    what should be on disk afterwards: fresh figures where a source answered,
+    the previous file's figures (and dates) where it did not, or None if a
+    figure failed and there is no previous file to fall back on.
+    `gold_outcomes` is survey_gold()'s per-source record, for update_health().
     """
     now = now or datetime.now(timezone.utc)
     previous = usable_previous(previous)
     problems = []
 
-    gold = equity = None
+    equity = None
+    gold, gold_outcomes = survey_gold(previous, now, fetcher)
+    if gold is None:
+        problems.append("gold price: " + "; ".join(gold_outcomes.values()))
     # The broad catch is deliberate: a source answering in a shape nobody
-    # anticipated must not take the other source down with it.
-    try:
-        gold = fetch_gold_price(previous, now, fetcher)
-    except SourceError as error:
-        problems.append(str(error))
-    except Exception as error:  # noqa: BLE001
-        problems.append(f"gold price: unexpected {type(error).__name__}: {error}")
+    # anticipated must not take the other figure down with it.
     try:
         equity = fetch_us_equity_market_value(fetcher)
     except SourceError as error:
@@ -517,7 +628,7 @@ def build(previous=None, now=None, fetcher=fetch):
         problems.append(f"Z.1: unexpected {type(error).__name__}: {error}")
 
     if previous is None and (gold is None or equity is None):
-        return None, problems
+        return None, problems, gold_outcomes
 
     if gold:
         price, gold_as_of = gold
@@ -549,13 +660,16 @@ def build(previous=None, now=None, fetcher=fetch):
         "all_gold_source": ALL_GOLD_SOURCE,
     }
     assert tuple(feed) == FEED_KEYS  # the app decodes exactly these
-    return feed, problems
+    return feed, problems, gold_outcomes
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate market.json, the daily feed behind the Gold Standard card.")
     parser.add_argument("--out", default="market.json", help="output path")
+    parser.add_argument("--health", metavar="FILE",
+                        help="remember here which gold sources are failing, and warn "
+                             "once one has failed for several days running")
     args = parser.parse_args(argv)
 
     previous = None
@@ -565,7 +679,20 @@ def main(argv=None):
     except (OSError, ValueError):
         pass  # First run, or an unreadable file we are about to replace.
 
-    feed, problems = build(previous)
+    now = datetime.now(timezone.utc)
+    feed, problems, gold_outcomes = build(previous, now)
+
+    warnings = []
+    if args.health:
+        try:
+            with open(args.health, encoding="utf-8") as handle:
+                health = json.load(handle)
+        except (OSError, ValueError):
+            health = None
+        health, warnings = update_health(health, gold_outcomes, now.strftime("%Y-%m-%d"))
+        with open(args.health, "w", encoding="utf-8") as handle:
+            json.dump(health, handle, indent=2)
+            handle.write("\n")
 
     if feed is None:
         # Write nothing. Whatever is published stays up, which is far better
@@ -585,6 +712,8 @@ def main(argv=None):
             print("market data build incomplete; figures that could not be refreshed "
                   "were carried forward under their old dates:", file=sys.stderr)
 
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
     for problem in problems:
         print(f"FAILED: {problem}", file=sys.stderr)
     return 1 if problems else 0

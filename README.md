@@ -8,7 +8,7 @@ The daily data feed behind the **Gold Standard** card in [Borrowed Time](https:/
 
 | Field | Source | Cadence |
 |---|---|---|
-| `gold_usd_per_troy_oz` | Spot gold (gold-api.com, falling back to Swissquote's public quotes) | Daily |
+| `gold_usd_per_troy_oz` | Spot gold: Swissquote's public quotes, then gold-api.com, then the daily currency-api snapshot | Daily |
 | `us_equity_market_value_usd` | Federal Reserve Z.1, corporate equities at market value (issuer side, series `LM103164105` + `LM793164105`) | Quarterly, ~75-day lag |
 | `all_gold_ever_mined_troy_oz` | World Gold Council above-ground stocks | Reviewed annually |
 
@@ -29,7 +29,8 @@ The generator is stdlib-only — no dependencies to rot.
 **Failure behaviour is deliberate:**
 
 - Each source fails on its own. Whatever was fetched is published; whatever was not keeps its previous value *and its previous "as of" date*.
-- Gold has two unrelated keyless sources, tried in order (`GOLD_SOURCES` in the script). A price that has moved more than 20% from the last published one is only believed if both agree.
+- Gold has three unrelated keyless sources (`GOLD_SOURCES` in the script). All three are asked on every run and the first believable price, in order, is published. A price that has moved more than 20% from the last published one is only believed if a second source agrees.
+- A gold source failing while another still supplies the price does not fail the run. `source_health.json` records since when each source has been failing, and once one has failed for three days running a `feed-degraded` issue is opened — once, not daily — so the feed never quietly wears down to its last source. It closes itself when every source answers again.
 - `generated_at` advances only when the gold price is fresh. It is the one field the app's staleness check reads, so a run that could not get gold can publish a new quarter's equities but cannot make an old price look new.
 - Any failed source fails the run — after a second attempt five minutes later — and opens (or comments on) a `feed-failure` issue that quotes which source and which field. The next clean run closes it.
 - Feed older than 21 days → **the app ignores it** and shows Treasury figures only. A dead job surfaces as missing rows, never as a stale number presented as current.

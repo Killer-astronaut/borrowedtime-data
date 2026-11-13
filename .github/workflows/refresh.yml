@@ -47,7 +47,7 @@ jobs:
         run: |
           attempt() {
             status=0
-            python3 build_market_data.py --out market.json 2> build-errors.txt || status=$?
+            python3 build_market_data.py --out market.json --health source_health.json 2> build-errors.txt || status=$?
             cat build-errors.txt >&2
           }
           attempt
@@ -61,8 +61,15 @@ jobs:
             echo "problems<<END_OF_PROBLEMS_7c1f"
             # The script's own one-line-per-source summary; failing that
             # (it crashed), the end of whatever it did say.
-            { grep '^FAILED: ' build-errors.txt || tail -n 5 build-errors.txt; } | cut -c1-600 | head -n 10
+            if [ "$status" -ne 0 ]; then
+              { grep '^FAILED: ' build-errors.txt || tail -n 5 build-errors.txt; } | cut -c1-600 | head -n 10
+            fi
             echo "END_OF_PROBLEMS_7c1f"
+            # A gold source that has failed for days while another still
+            # supplies the price. Not a failure; see the last-but-one step.
+            echo "warnings<<END_OF_WARNINGS_7c1f"
+            { grep '^WARNING: ' build-errors.txt || true; } | cut -c1-600 | head -n 10
+            echo "END_OF_WARNINGS_7c1f"
           } >> "$GITHUB_OUTPUT"
           rm -f build-errors.txt
 
@@ -92,15 +99,17 @@ jobs:
                 f"generated {feed['generated_at']}")
           PY
 
+      # source_health.json is the script's memory of which gold sources are
+      # failing; it only changes when a source starts or stops failing.
       - name: Commit if the numbers changed
         run: |
-          if git diff --quiet -- market.json; then
+          git add market.json source_health.json
+          if git diff --cached --quiet; then
             echo "No change; nothing to publish."
             exit 0
           fi
           git config user.name "borrowedtime-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add market.json
           git commit -m "Refresh market data"
           git push
 
@@ -115,6 +124,54 @@ jobs:
             gh issue comment "$n" --body "Recovered: [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) published successfully."
             gh issue close "$n"
           done
+
+      # The feed is fine, but it is running on fewer gold sources than it
+      # should be, and has been for days. One issue, opened once and left
+      # alone until the source recovers or is replaced — not a daily comment.
+      - name: Flag a gold source that keeps failing
+        # Only after a clean build: a failed one already raises the louder
+        # alarm, and must not close this issue as "recovered".
+        if: steps.build.outputs.status == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WARNINGS: ${{ steps.build.outputs.warnings }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          open=$(gh issue list --label feed-degraded --state open --json number --jq '.[].number')
+          if [ -z "$WARNINGS" ]; then
+            for n in $open; do
+              gh issue comment "$n" --body "Recovered: every gold source answered in [run ${{ github.run_id }}]($RUN_URL)."
+              gh issue close "$n"
+            done
+            exit 0
+          fi
+          echo "::warning::A gold source has been failing for days. The feed is still being published from the others."
+          if [ -n "$open" ]; then
+            echo "Already reported in issue $open."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/degraded.md" <<EOF
+          The feed is still being published, but a gold price source has failed on
+          every run for several days and another source is covering for it.
+
+          **Run:** $RUN_URL
+
+          \`\`\`
+          $WARNINGS
+          \`\`\`
+
+          Nothing is wrong with the app or the published figures. This is here
+          because the feed has fewer working gold sources than it was built with,
+          and the day the remaining ones fail too, the price stops updating.
+
+          Fix or replace the source in \`GOLD_SOURCES\` in \`build_market_data.py\`.
+          This issue closes itself on the first run where every source answers.
+          EOF
+          # The label is created on first use; --force makes that idempotent.
+          gh label create feed-degraded --color FBCA04 --force \
+            --description "A gold source keeps failing; the feed is running on the others" || true
+          gh issue create --title "A gold price source keeps failing" --label feed-degraded --body-file "$RUNNER_TEMP/degraded.md"
 
       - name: Fail the run if any source failed
         if: steps.build.outputs.status != '0'
