@@ -1,0 +1,14 @@
+{
+  "Swissquote": {
+    "failing_since": null,
+    "last_error": null
+  },
+  "gold-api.com": {
+    "failing_since": null,
+    "last_error": null
+  },
+  "currency-api": {
+    "failing_since": null,
+    "last_error": null
+  }
+}
